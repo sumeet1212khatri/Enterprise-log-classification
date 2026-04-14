@@ -6,8 +6,13 @@ from __future__ import annotations
 import io
 import time
 import pandas as pd
+import numpy as np  # <-- Added numpy for percentiles
 import gradio as gr
 from classify import classify_log, classify_csv
+from processor_bert import preload_models
+
+# ── Preload models in background at startup ─────────────────
+preload_models()
 
 SOURCES = [
     "ModernCRM", "ModernHR", "BillingSystem",
@@ -382,8 +387,11 @@ code, pre {
 
 # ── Functions ───────────────────────────────────────────────────────────────
 def classify_single(source: str, log_message: str):
+    from processor_bert import _model_ready
     if not log_message.strip():
         return "—", "—", "—", "—"
+    if not _model_ready:
+        return "⏳ Model loading...", "Please wait ~60s", "—", "—"
     t0 = time.perf_counter()
     result = classify_log(source, log_message)
     latency_ms = (time.perf_counter() - t0) * 1000
@@ -397,49 +405,76 @@ def classify_single(source: str, log_message: str):
 def classify_batch(file):
     if file is None:
         return None, "⚠️ Please upload a CSV file."
+        
+    t0 = time.perf_counter() # Start Total Timer
+    
     try:
         output_path, df = classify_csv(file.name, "/tmp/classified_output.csv")
     except ValueError as e:
         return None, f"⚠️ {e}"
     except Exception as e:
         return None, f"❌ Error: {e}"
+        
+    total_time_sec = time.perf_counter() - t0 # End Total Timer
     total = len(df)
+    
     tier_counts  = df["tier_used"].value_counts().to_dict()
     label_counts = df["predicted_label"].value_counts().to_dict()
+    
     tier_lines  = "\n".join(f"  {TIER_COLORS.get(k,'⚪')} {k}: {v} ({v/total:.0%})" for k, v in tier_counts.items())
     label_lines = "\n".join(f"  • {k}: {v}" for k, v in label_counts.items())
+    
+    # Calculate Latencies
+    if "latency_ms" in df.columns and not df["latency_ms"].empty:
+        latencies = df["latency_ms"].dropna()
+        p50 = np.percentile(latencies, 50)
+        p95 = np.percentile(latencies, 95)
+        p99 = np.percentile(latencies, 99)
+        latency_stats = (
+            f"⏱️ Performance Metrics:\n"
+            f"  • Total Time: {total_time_sec:.2f} s\n"
+            f"  • P50 Latency: {p50:.1f} ms\n"
+            f"  • P95 Latency: {p95:.1f} ms\n"
+            f"  • P99 Latency: {p99:.1f} ms"
+        )
+    else:
+        latency_stats = (
+            f"⏱️ Performance Metrics:\n"
+            f"  • Total Time: {total_time_sec:.2f} s\n"
+            f"  • (Latency stats unavailable: 'latency_ms' not found in output)"
+        )
+    
     stats = (
         f"✅ Classified {total} logs\n\n"
         f"📊 Tier breakdown:\n{tier_lines}\n\n"
-        f"🏷️ Label distribution:\n{label_lines}"
+        f"🏷️ Label distribution:\n{label_lines}\n\n"
+        f"{latency_stats}"
     )
     return output_path, stats
 
 
 # ── UI ───────────────────────────────────────────────────────────────────────
-with gr.Blocks(
-    title="LOG CLASSIFICATION SYSTEM",
-    theme=gr.themes.Base(
-        primary_hue="blue",
-        secondary_hue="cyan",
-        neutral_hue="slate",
-        font=[gr.themes.GoogleFont("Exo 2"), "sans-serif"],
-        font_mono=[gr.themes.GoogleFont("Share Tech Mono"), "monospace"],
-    ).set(
-        body_background_fill="#050810",
-        body_text_color="#e2e8f0",
-        block_background_fill="#0d1425",
-        block_border_color="rgba(0,212,255,0.15)",
-        block_label_text_color="#00d4ff",
-        input_background_fill="#050810",
-        input_border_color="rgba(0,212,255,0.2)",
-        button_primary_background_fill="linear-gradient(135deg, #0066ff, #00d4ff)",
-        button_primary_text_color="#ffffff",
-        border_color_accent="#00d4ff",
-        color_accent_soft="rgba(0,212,255,0.1)",
-    ),
-    css=CUSTOM_CSS
-) as demo:
+THEME = gr.themes.Base(
+    primary_hue="blue",
+    secondary_hue="cyan",
+    neutral_hue="slate",
+    font=[gr.themes.GoogleFont("Exo 2"), "sans-serif"],
+    font_mono=[gr.themes.GoogleFont("Share Tech Mono"), "monospace"],
+).set(
+    body_background_fill="#050810",
+    body_text_color="#e2e8f0",
+    block_background_fill="#0d1425",
+    block_border_color="rgba(0,212,255,0.15)",
+    block_label_text_color="#00d4ff",
+    input_background_fill="#050810",
+    input_border_color="rgba(0,212,255,0.2)",
+    button_primary_background_fill="linear-gradient(135deg, #0066ff, #00d4ff)",
+    button_primary_text_color="#ffffff",
+    border_color_accent="#00d4ff",
+    color_accent_soft="rgba(0,212,255,0.1)",
+)
+
+with gr.Blocks(title="LOG CLASSIFICATION SYSTEM") as demo:
 
     gr.Markdown("""
 # 🔍 LOG CLASSIFICATION SYSTEM
@@ -489,8 +524,7 @@ with gr.Blocks(
         with gr.Tab("📦 BATCH CSV"):
             gr.Markdown("""
 ### Bulk Classification
-Upload a CSV with columns: **`source`**, **`log_message`**  
-Output includes: `predicted_label`, `tier_used`, `confidence`, `latency_ms`
+Upload a CSV with columns: **`source`**, **`log_message`** Output includes: `predicted_label`, `tier_used`, `confidence`, `latency_ms`
 """)
             with gr.Row():
                 with gr.Column():
@@ -498,7 +532,8 @@ Output includes: `predicted_label`, `tier_used`, `confidence`, `latency_ms`
                     batch_btn  = gr.Button("▶  CLASSIFY ALL", variant="primary")
                 with gr.Column():
                     csv_output = gr.File(label="📥 DOWNLOAD RESULTS")
-                    stats_out  = gr.Textbox(label="📊 STATISTICS", lines=12, interactive=False)
+                    # Increased lines to 16 to properly fit the latency metrics
+                    stats_out  = gr.Textbox(label="📊 STATISTICS", lines=16, interactive=False)
 
             batch_btn.click(
                 fn=classify_batch,
@@ -508,15 +543,9 @@ Output includes: `predicted_label`, `tier_used`, `confidence`, `latency_ms`
 
             gr.Markdown("""
 **Sample CSV format:**
-```
-source,log_message
-ModernCRM,User User123 logged in.
-LegacyCRM,Case escalation for ticket ID 7324 failed.
-BillingSystem,GET /api/v2/invoice HTTP/1.1 status: 500
-```
-""")
+            """)
 
-        # ── Tab 3: Architecture ───────────────────────────────────────────
+            # ── Tab 3: Architecture ───────────────────────────────────────────
         with gr.Tab("🏗️ ARCHITECTURE"):
             gr.Markdown("""
 ## 3-Tier Hybrid Pipeline
@@ -538,5 +567,5 @@ BillingSystem,GET /api/v2/invoice HTTP/1.1 status: 500
 | `HF_TOKEN` | LLM inference for LegacyCRM logs |
 """)
 
-if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+# Seedha launch karein, bina if __name__ == "__main__": ke
+demo.launch(server_name="0.0.0.0", server_port=7860, theme=THEME, css=CUSTOM_CSS)

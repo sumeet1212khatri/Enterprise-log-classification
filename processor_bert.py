@@ -9,6 +9,7 @@ Kaise kaam karta hai:
 """
 from __future__ import annotations
 import os
+import threading
 import numpy as np
 import joblib
 
@@ -18,6 +19,8 @@ _embedding_model = None
 _classifier       = None
 _ort_session      = None
 _ort_tokenizer    = None
+_model_ready      = False
+_load_lock        = threading.Lock()
 
 MODEL_PATH    = os.path.join(os.path.dirname(__file__), 'models', 'log_classifier.joblib')
 ONNX_DIR      = os.path.join(os.path.dirname(__file__), 'models', 'onnx')
@@ -25,12 +28,18 @@ CONFIDENCE_THRESHOLD = 0.30
 DEFAULT_BATCH = 64
 
 
-def _load_models():
-    """Lazily load models — pehli call pe hi load hoga, baar baar nahi."""
-    global _USE_ONNX, _embedding_model, _classifier, _ort_session, _ort_tokenizer
+def preload_models():
+    """App startup pe background thread mein models load karo."""
+    threading.Thread(target=_load_models, daemon=True).start()
 
-    if _classifier is not None:
-        return  # Already loaded
+
+def _load_models():
+    """Lazily load models — thread-safe, sirf ek baar load hoga."""
+    global _USE_ONNX, _embedding_model, _classifier, _ort_session, _ort_tokenizer, _model_ready
+
+    with _load_lock:
+        if _classifier is not None:
+            return  # Already loaded
 
     # ── Classifier load karo ───────────────────────────────
     if not os.path.exists(MODEL_PATH):
@@ -71,6 +80,9 @@ def _load_models():
         from sentence_transformers import SentenceTransformer
         _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         print('[BERT] ⚠️  PyTorch mode (install ONNX for 3-5x speedup)')
+
+    _model_ready = True
+    print('[BERT] ✅ Models ready!')
 
 
 def _embed_onnx(texts: list[str]) -> np.ndarray:

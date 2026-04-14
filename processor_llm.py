@@ -1,10 +1,8 @@
 """
 processor_llm.py — Tier 3: LLM-based Classifier
-
 Used for:
   - LegacyCRM logs (Workflow Error, Deprecation Warning)
   - BERT fallback when confidence < threshold
-
 Production hardening in V3:
   - Timeout (configurable, default 5s)
   - Retry with exponential backoff (max 2 retries)
@@ -18,7 +16,7 @@ import re
 import time
 import hashlib
 import logging
-from functools import lru_cache
+
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -117,7 +115,6 @@ def classify_with_llm(log_msg: str) -> str:
       - Timeout (REQUEST_TIMEOUT seconds)
       - Retry with exponential backoff (MAX_RETRIES attempts)
       - Explicit fallback to "Unclassified" on all error paths
-
     Latency: 500–2000ms on cache miss; ~0ms on cache hit.
     """
     # ── Cache hit ────────────────────────────────────────────────────────────
@@ -153,13 +150,19 @@ def classify_with_llm(log_msg: str) -> str:
             return label
 
         except Exception as e:
+            # 🚨 JUGAD: Agar credits khatam hain (402), toh turant fallback do
+            # Isse UI hang nahi hoga aur retry ka wait nahi karna padega
+            if "402" in str(e) or "credits" in str(e).lower():
+                logger.error(f"[LLM] Credits Finished (402). Returning Fallback Label.")
+                return "Escalated: Manual Review Required (API Limit)"
+            
             last_err = e
             if attempt <= MAX_RETRIES:
                 logger.warning(f"[LLM] Attempt {attempt} failed ({e}), retrying in {delay:.1f}s…")
                 time.sleep(delay)
                 delay *= 2  # exponential backoff
             else:
-                logger.error(f"[LLM] All {MAX_RETRIES + 1} attempts failed. Last error: {e}")
+                logger.error(f"[LLM] All attempts failed. Last error: {e}")
 
     return "Unclassified"
 

@@ -1,20 +1,8 @@
-"""
-processor_llm.py — Tier 3: LLM-based Classifier
-Used for:
-  - LegacyCRM logs (Workflow Error, Deprecation Warning)
-  - BERT fallback when confidence < threshold
-Production hardening in V3:
-  - Timeout (configurable, default 5s)
-  - Retry with exponential backoff (max 2 retries)
-  - Explicit failure modes: returns "Unclassified" on all error paths
-  - Caching for repeated log patterns (hash-based, in-memory)
-  - Token budget enforcement (max_tokens=15)
-"""
+
 from __future__ import annotations
 import os
 import re
 import time
-import hashlib
 import logging
 
 from typing import Optional
@@ -31,10 +19,6 @@ VALID_CATEGORIES = ["Workflow Error", "Deprecation Warning"]
 MAX_RETRIES     = 2
 RETRY_DELAY_SEC = 1.0   # doubles on each retry (exponential backoff)
 REQUEST_TIMEOUT = 5     # seconds — fail fast, do not hang pipeline
-
-# In-memory cache to avoid redundant LLM calls for repeated logs
-_RESPONSE_CACHE: dict[str, str] = {}
-MAX_CACHE_SIZE = 1000  # evict oldest when full (simple FIFO)
 
 SYSTEM_PROMPT = (
     "You are an enterprise log classifier. "
@@ -56,29 +40,6 @@ FEW_SHOT_EXAMPLES = [
         "label": "Workflow Error",
     },
 ]
-
-
-# ── Cache helpers ────────────────────────────────────────────────────────────
-def _cache_key(log_msg: str) -> str:
-    return hashlib.md5(log_msg.strip().encode()).hexdigest()
-
-
-def _cache_get(log_msg: str) -> Optional[str]:
-    return _RESPONSE_CACHE.get(_cache_key(log_msg))
-
-
-def _cache_set(log_msg: str, label: str) -> None:
-    key = _cache_key(log_msg)
-    if len(_RESPONSE_CACHE) >= MAX_CACHE_SIZE:
-        # Evict oldest (first inserted) key
-        oldest = next(iter(_RESPONSE_CACHE))
-        del _RESPONSE_CACHE[oldest]
-    _RESPONSE_CACHE[key] = label
-
-
-def get_cache_stats() -> dict:
-    return {"size": len(_RESPONSE_CACHE), "max_size": MAX_CACHE_SIZE}
-
 
 # ── Prompt builder ───────────────────────────────────────────────────────────
 def _build_messages(log_msg: str) -> list[dict]:
@@ -111,18 +72,10 @@ def _normalize(raw: str) -> str:
 def classify_with_llm(log_msg: str) -> str:
     """
     Tier 3 LLM classifier with:
-      - In-memory cache (avoids duplicate API calls)
       - Timeout (REQUEST_TIMEOUT seconds)
       - Retry with exponential backoff (MAX_RETRIES attempts)
       - Explicit fallback to "Unclassified" on all error paths
-    Latency: 500–2000ms on cache miss; ~0ms on cache hit.
     """
-    # ── Cache hit ────────────────────────────────────────────────────────────
-    cached = _cache_get(log_msg)
-    if cached is not None:
-        logger.debug(f"[LLM] Cache hit for: {log_msg[:60]}")
-        return cached
-
     # ── Inference with retry ─────────────────────────────────────────────────
     if not HF_TOKEN:
         logger.warning("[LLM] HF_TOKEN not set — returning Unclassified")
@@ -145,7 +98,6 @@ def classify_with_llm(log_msg: str) -> str:
             raw   = response.choices[0].message.content
             label = _normalize(raw)
 
-            _cache_set(log_msg, label)
             logger.debug(f"[LLM] Attempt {attempt}: '{raw.strip()}' → '{label}'")
             return label
 
@@ -185,11 +137,3 @@ if __name__ == "__main__":
     for log in test_logs:
         result = classify_with_llm(log)
         print(f"{result:25s} | {log[:80]}")
-
-    # Cache hit test
-    print("\n── Cache hit test ──")
-    t0 = time.perf_counter()
-    classify_with_llm(test_logs[0])
-    t1 = time.perf_counter()
-    print(f"Cache hit latency: {(t1-t0)*1000:.2f}ms")
-    print(f"Cache stats: {get_cache_stats()}")

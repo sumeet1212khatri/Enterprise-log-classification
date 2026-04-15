@@ -1,23 +1,23 @@
 """
-classify.py — 3-Tier Hybrid Pipeline (V4 — MAANG-Grade Telemetry & Caching)
+classify.py — 3-Tier Hybrid Pipeline (V5 — Multiprocessing & Max RAM Utilization)
 
 Architecture:
   LegacyCRM → LLM directly
   Others    → Regex → BERT (batch) → LLM fallback
 
-Changes in V4:
-  - High-resolution telemetry (4 decimal places) to capture sub-ms Regex execution.
-  - True Batch Latency tracking for BERT (decoupled from individual log spoofing).
-  - MD5 Hashing & LRU Cache layer for the LLM to mathematically prove cost savings.
-  - Parallelized LLM Tier using ThreadPoolExecutor for high throughput.
+Changes in V5:
+  - Added ProcessPoolExecutor for classify_csv to distribute workload across all CPU cores.
+  - Increased LRU cache size to 500,000 to maximize RAM usage and minimize LLM calls during 2M+ log stress tests.
+  - High-resolution telemetry and True Batch Latency tracking retained from V4.
 """
 from __future__ import annotations
+import os
 import time
 import hashlib
 import statistics
 import pandas as pd
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from processor_regex import classify_with_regex
 from processor_bert  import classify_batch as bert_batch
 from processor_llm   import classify_with_llm
@@ -31,13 +31,12 @@ def _make_result(label: str, tier: str, confidence, latency_ms: float) -> dict:
         "label":      label,
         "tier":       tier,
         "confidence": confidence,
-        # FIX 2: Increased clock resolution to 4 decimal places for sub-ms accuracy
         "latency_ms": round(latency_ms, 4), 
     }
 
 
-# ── Caching Layer (FIX 3) ───────────────────────────────────────────────────
-@lru_cache(maxsize=10000)
+# ── Caching Layer (V5 UPDATE: Max RAM Eater) ────────────────────────────────
+@lru_cache(maxsize=500000) # Increased to 500k to absorb duplicate logs in 2M+ datasets
 def cached_llm_call(log_hash: str, log_msg: str) -> str:
     """Only executes the expensive LLM call if the MD5 hash misses the cache."""
     return classify_with_llm(log_msg)
@@ -83,8 +82,6 @@ def classify_logs(logs: list[tuple[str, str]]) -> list[dict]:
         bert_results = bert_batch(bert_msgs)
         t_bert_end   = time.perf_counter()
 
-        # We keep the amortized calculation strictly for the CSV line items,
-        # but the pipeline_summary will handle reporting this as a Batch.
         bert_ms_per_log = (t_bert_end - t_bert_start) * 1000 / len(bert_msgs)
 
         for idx, (label, conf) in zip(bert_indices, bert_results):
@@ -98,7 +95,6 @@ def classify_logs(logs: list[tuple[str, str]]) -> list[dict]:
         def parallel_llm(idx):
             src, msg = logs[idx]
             
-            # FIX 3: Generate MD5 hash of the log string
             log_hash = hashlib.md5(msg.encode('utf-8')).hexdigest()
             
             t_llm_0 = time.perf_counter()
@@ -106,13 +102,10 @@ def classify_logs(logs: list[tuple[str, str]]) -> list[dict]:
             t_llm_ms = (time.perf_counter() - t_llm_0) * 1000
             
             base_tier = "LLM" if src == LEGACY_SOURCE else "LLM (fallback)"
-            
-            # Categorize the telemetry based on execution time (Sub 5ms = Memory Hit)
             tier = f"{base_tier} (Cache Hit)" if t_llm_ms < 5 else f"{base_tier} (API Call)"
             
             return idx, _make_result(label, tier, None, t_llm_ms)
 
-        # Parallelize API calls to prevent pipeline stall, restricted to 4 workers to prevent OOM
         with ThreadPoolExecutor(max_workers=4) as executor:
             llm_results = list(executor.map(parallel_llm, llm_indices))
 
@@ -144,12 +137,11 @@ def pipeline_summary(results: list[dict]) -> dict:
         tier_stats[tier] = {
             "count":    n,
             "pct":      round(n / total * 100, 1),
-            # FIX 2: Prevent flatlining at 0.0 by expanding decimal precision
             "p50_ms":   round(statistics.median(latencies_sorted), 4),
             "p95_ms":   round(latencies_sorted[min(int(n * 0.95), n - 1)], 4),
             "p99_ms":   round(latencies_sorted[min(int(n * 0.99), n - 1)], 4),
             "mean_ms":  round(statistics.mean(latencies_sorted), 4),
-            "total_ms": round(sum(latencies_sorted), 4), # Required for Batch calculation
+            "total_ms": round(sum(latencies_sorted), 4), 
         }
 
     return {
@@ -159,12 +151,17 @@ def pipeline_summary(results: list[dict]) -> dict:
     }
 
 
-# ── CSV batch classify ───────────────────────────────────────────────────────
+# ── Multiprocessing Helper ───────────────────────────────────────────────────
+def _process_chunk(chunk: list[tuple[str, str]]) -> list[dict]:
+    """Top-level helper function required for ProcessPoolExecutor mapping."""
+    return classify_logs(chunk)
+
+
+# ── CSV batch classify (V5 UPDATE: Multi-Core Processor) ─────────────────────
 def classify_csv(input_path: str, output_path: str = "output.csv") -> tuple[str, pd.DataFrame]:
     """
-    Process a batch of logs from a CSV file.
-    Required columns: 'source', 'log_message'
-    Output: appends 'predicted_label', 'tier_used', 'confidence', 'latency_ms'
+    Ultra-Optimized Batch Processing for 2M+ Logs.
+    Uses ProcessPoolExecutor to max out CPU cores and gorge on RAM.
     """
     df = pd.read_csv(input_path)
     required = {"source", "log_message"}
@@ -172,7 +169,21 @@ def classify_csv(input_path: str, output_path: str = "output.csv") -> tuple[str,
         raise ValueError(f"Missing required columns in CSV. Expected: {required}. Found: {set(df.columns)}")
 
     log_pairs = list(zip(df["source"], df["log_message"]))
-    results   = classify_logs(log_pairs)
+    total_logs = len(log_pairs)
+    
+    # OS ke liye 1 core chhod kar baaki sab use karo
+    max_cores = max(1, os.cpu_count() - 1)
+    
+    # 50,000 logs ke chunks banao (Memory distribution)
+    chunk_size = 50000 
+    chunks = [log_pairs[i:i + chunk_size] for i in range(0, total_logs, chunk_size)]
+    
+    results = []
+    
+    print(f"🔥 Firing up {max_cores} CPU cores to process {len(chunks)} chunks...")
+    with ProcessPoolExecutor(max_workers=max_cores) as executor:
+        for chunk_result in executor.map(_process_chunk, chunks):
+            results.extend(chunk_result)
 
     df["predicted_label"] = [r["label"]       for r in results]
     df["tier_used"]       = [r["tier"]        for r in results]
@@ -192,6 +203,8 @@ classify = classify_logs
 
 # ── Self-test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Required for safe multiprocessing on Windows/macOS
+    # Ensures child processes don't recursively run the __main__ block
     sample = [
         ("ModernCRM",       "IP 192.168.133.114 blocked due to potential attack"),
         ("BillingSystem",   "User User12345 logged in."),
@@ -199,7 +212,7 @@ if __name__ == "__main__":
         ("ModernHR",        "GET /v2/servers/detail HTTP/1.1 status: 200 len: 1583 time: 0.19"),
         ("ModernHR",        "Admin access escalation detected for user 9429"),
         ("LegacyCRM",       "Case escalation for ticket ID 7324 failed because the assigned support agent is no longer active."),
-        ("LegacyCRM",       "Case escalation for ticket ID 7324 failed because the assigned support agent is no longer active."), # Deliberate duplicate to test MD5 Cache
+        ("LegacyCRM",       "Case escalation for ticket ID 7324 failed because the assigned support agent is no longer active."), 
     ]
 
     print(f'{"Source":<20} {"Tier":<22} {"Conf":>6} {"Lat(ms)":>8}  {"Label":<25} Log')
@@ -212,7 +225,6 @@ if __name__ == "__main__":
     summary = pipeline_summary(results)
     print("\n📊 Pipeline Summary:")
     
-    # FIX 1: Decoupling the reporting output to reflect architectural reality
     for tier, stats in summary["tier_stats"].items():
         if tier == "BERT":
              print(f"  BERT Batch Latency: {stats['total_ms']} ms (Amortized over {stats['count']} logs)")

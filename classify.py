@@ -1,28 +1,17 @@
-"""
-classify.py — 3-Tier Hybrid Pipeline (V5 — Multiprocessing & Max RAM Utilization)
 
-Architecture:
-  LegacyCRM → LLM directly
-  Others    → Regex → BERT (batch) → LLM fallback
-
-Changes in V5:
-  - Added ProcessPoolExecutor for classify_csv to distribute workload across all CPU cores.
-  - Increased LRU cache size to 500,000 to maximize RAM usage and minimize LLM calls during 2M+ log stress tests.
-  - High-resolution telemetry and True Batch Latency tracking retained from V4.
-"""
 from __future__ import annotations
 import os
 import time
-import hashlib
 import statistics
 import pandas as pd
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from processor_regex import classify_with_regex
 from processor_bert  import classify_batch as bert_batch
 from processor_llm   import classify_with_llm
 
-LEGACY_SOURCE = "LegacyCRM"
+# ── Config ──────────────────────────────────────────────────────────────────
+LEGACY_SOURCE = os.getenv("LEGACY_SOURCE", "LegacyCRM")
 
 
 # ── Result type ─────────────────────────────────────────────────────────────
@@ -37,8 +26,8 @@ def _make_result(label: str, tier: str, confidence, latency_ms: float) -> dict:
 
 # ── Caching Layer (V5 UPDATE: Max RAM Eater) ────────────────────────────────
 @lru_cache(maxsize=500000) # Increased to 500k to absorb duplicate logs in 2M+ datasets
-def cached_llm_call(log_hash: str, log_msg: str) -> str:
-    """Only executes the expensive LLM call if the MD5 hash misses the cache."""
+def cached_llm_call(log_msg: str) -> str:
+    """Only executes the expensive LLM call if the string misses the cache."""
     return classify_with_llm(log_msg)
 
 
@@ -95,10 +84,9 @@ def classify_logs(logs: list[tuple[str, str]]) -> list[dict]:
         def parallel_llm(idx):
             src, msg = logs[idx]
             
-            log_hash = hashlib.md5(msg.encode('utf-8')).hexdigest()
-            
             t_llm_0 = time.perf_counter()
-            label = cached_llm_call(log_hash, msg)
+            # Removed redundant MD5 hashing; standard string key is safer and faster
+            label = cached_llm_call(msg)
             t_llm_ms = (time.perf_counter() - t_llm_0) * 1000
             
             base_tier = "LLM" if src == LEGACY_SOURCE else "LLM (fallback)"
@@ -106,7 +94,8 @@ def classify_logs(logs: list[tuple[str, str]]) -> list[dict]:
             
             return idx, _make_result(label, tier, None, t_llm_ms)
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        # Removed hardcoded max_workers=4 to allow auto-scaling based on CPU cores
+        with ThreadPoolExecutor() as executor:
             llm_results = list(executor.map(parallel_llm, llm_indices))
 
         for idx, res in llm_results:
@@ -153,7 +142,7 @@ def pipeline_summary(results: list[dict]) -> dict:
 
 # ── Multiprocessing Helper ───────────────────────────────────────────────────
 def _process_chunk(chunk: list[tuple[str, str]]) -> list[dict]:
-    """Top-level helper function required for ProcessPoolExecutor mapping."""
+    """Top-level helper function required for ThreadPoolExecutor mapping."""
     return classify_logs(chunk)
 
 
@@ -161,7 +150,7 @@ def _process_chunk(chunk: list[tuple[str, str]]) -> list[dict]:
 def classify_csv(input_path: str, output_path: str = "output.csv") -> tuple[str, pd.DataFrame]:
     """
     Ultra-Optimized Batch Processing for 2M+ Logs.
-    Uses ProcessPoolExecutor to max out CPU cores and gorge on RAM.
+    Uses ThreadPoolExecutor to share the massive lru_cache across chunks.
     """
     df = pd.read_csv(input_path)
     required = {"source", "log_message"}
@@ -180,10 +169,16 @@ def classify_csv(input_path: str, output_path: str = "output.csv") -> tuple[str,
     
     results = []
     
-    print(f"🔥 Firing up {max_cores} CPU cores to process {len(chunks)} chunks...")
-    with ProcessPoolExecutor(max_workers=max_cores) as executor:
+    # Switched to ThreadPoolExecutor so memory (lru_cache) is shared properly
+    print(f"🔥 Firing up {max_cores} worker threads to process {len(chunks)} chunks...")
+    
+    t_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=max_cores) as executor:
         for chunk_result in executor.map(_process_chunk, chunks):
             results.extend(chunk_result)
+    t_end = time.perf_counter()
+    
+    print(f"⏱️ True Wall-Clock Processing Time: {(t_end - t_start):.2f} seconds")
 
     df["predicted_label"] = [r["label"]       for r in results]
     df["tier_used"]       = [r["tier"]        for r in results]
@@ -203,8 +198,6 @@ classify = classify_logs
 
 # ── Self-test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Required for safe multiprocessing on Windows/macOS
-    # Ensures child processes don't recursively run the __main__ block
     sample = [
         ("ModernCRM",       "IP 192.168.133.114 blocked due to potential attack"),
         ("BillingSystem",   "User User12345 logged in."),
@@ -226,9 +219,7 @@ if __name__ == "__main__":
     print("\n📊 Pipeline Summary:")
     
     for tier, stats in summary["tier_stats"].items():
-        if tier == "BERT":
-             print(f"  BERT Batch Latency: {stats['total_ms']} ms (Amortized over {stats['count']} logs)")
-        elif "Regex" in tier:
+        if "Regex" in tier:
              print(f"  Regex Latency: < 0.1 ms (Recorded p50: {stats['p50_ms']} ms) | count={stats['count']}")
         else:
             print(f"  {tier}: {stats['count']} logs ({stats['pct']}%) | "

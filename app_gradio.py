@@ -19,12 +19,14 @@ SOURCES = [
     "AnalyticsEngine", "ThirdPartyAPI", "LegacyCRM",
 ]
 
-TIER_COLORS = {
-    "Regex":          "🟢",
-    "BERT":           "🔵",
-    "LLM":            "🟡",
-    "LLM (fallback)": "🟠",
-}
+# Updated to dynamically support the new Cache Hit tiers
+def get_tier_icon(tier_name: str) -> str:
+    if "Regex" in tier_name: return "🟢"
+    if "BERT" in tier_name: return "🔵"
+    if "Cache Hit" in tier_name: return "⚡" # Make the cost savings pop in the UI
+    if "fallback" in tier_name: return "🟠"
+    if "LLM" in tier_name: return "🟡"
+    return "⚪"
 
 EXAMPLE_LOGS = [
     ["ModernCRM",       "User User12345 logged in."],
@@ -37,21 +39,25 @@ EXAMPLE_LOGS = [
 # ── Custom CSS (Ultra-Modern 3D Theme) ────────────────────────
 CUSTOM_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@600;700&family=Share+Tech+Mono&family=Exo+2:wght@400;600&display=swap');
+
 :root {
     --bg-primary: #050810;
     --accent-cyan: #00d4ff;
     --text-primary: #e2e8f0;
 }
+
 body, .gradio-container { 
     background: var(--bg-primary) !important; 
     font-family: 'Exo 2', sans-serif !important; 
 }
+
 .gradio-group { 
     background: #0d1425 !important; 
     border: 1px solid rgba(0, 212, 255, 0.1) !important; 
     border-radius: 20px !important; 
     box-shadow: 0 10px 30px rgba(0,0,0,0.5) !important;
 }
+
 button.primary {
     background: linear-gradient(135deg, #0066ff, #00d4ff) !important;
     border: none !important;
@@ -61,10 +67,12 @@ button.primary {
     box-shadow: 0 4px 15px rgba(0, 102, 255, 0.4) !important;
     transition: all 0.2s ease !important;
 }
+
 button.primary:hover {
     transform: translateY(-2px) !important;
     box-shadow: 0 8px 25px rgba(0, 212, 255, 0.5) !important;
 }
+
 .output-stats textarea {
     font-family: 'Share Tech Mono', monospace !important;
     background: #050810 !important;
@@ -85,12 +93,12 @@ def classify_single(source: str, log_message: str):
     try:
         result = classify_log(source, log_message)
         latency = (time.perf_counter() - t0) * 1000
-        icon = TIER_COLORS.get(result["tier"], "⚪")
+        icon = get_tier_icon(result["tier"])
         return (
             result["label"], 
             f"{icon} {result['tier']}", 
             f"{result['confidence']:.1%}" if result["confidence"] else "N/A", 
-            f"{latency:.1f} ms"
+            f"{latency:.4f} ms" # FIX: Expose the true sub-millisecond telemetry
         )
     except Exception as e:
         return f"Error: {str(e)}", "Fail", "—", "—"
@@ -109,35 +117,36 @@ def classify_batch(file, progress=gr.Progress(track_tqdm=True)):
         progress(0.9, desc="📊 Calculating Metrics...")
         
         total = len(df)
-        tier_counts = df["tier_used"].value_counts().to_dict()
         label_counts = df["predicted_label"].value_counts().to_dict()
+        tier_counts = df["tier_used"].value_counts().to_dict()
         
-        # Tier Breakdown with Percentages
-        tier_lines = "\n".join([
-            f"  {TIER_COLORS.get(k,'⚪')} {k}: {v} ({v/total:.0%})" 
-            for k, v in tier_counts.items()
-        ])
+        # FIX: Decouple Latency Metrics per tier instead of global distribution
+        tier_lines = []
+        for tier, count in tier_counts.items():
+            tier_df = df[df["tier_used"] == tier]
+            lats = tier_df["latency_ms"].dropna()
+            icon = get_tier_icon(tier)
+            pct = count / total
+            
+            if "BERT" in tier:
+                total_ms = lats.sum()
+                tier_lines.append(f"  {icon} {tier}: Batch Latency {total_ms:.1f} ms (Over {count} logs)")
+            elif "Regex" in tier:
+                p50 = np.percentile(lats, 50) if not lats.empty else 0
+                tier_lines.append(f"  {icon} {tier}: < 0.1 ms (p50: {p50:.4f} ms) | {count} logs ({pct:.0%})")
+            else:
+                p50 = np.percentile(lats, 50) if not lats.empty else 0
+                p95 = np.percentile(lats, 95) if not lats.empty else 0
+                p99 = np.percentile(lats, 99) if not lats.empty else 0
+                tier_lines.append(f"  {icon} {tier}: {count} logs ({pct:.0%}) | p50={p50:.1f}ms p95={p95:.1f}ms p99={p99:.1f}ms")
         
-        # Label Distribution
+        tier_lines_str = "\n".join(tier_lines)
         label_lines = "\n".join([f"  • {k}: {v}" for k, v in label_counts.items()])
         
-        # Latency Metrics (P50, P95, P99)
-        if "latency_ms" in df.columns:
-            lats = df["latency_ms"].dropna()
-            p50, p95, p99 = np.percentile(lats, 50), np.percentile(lats, 95), np.percentile(lats, 99)
-        else:
-            # Fallback if logic is purely regex
-            p50, p95, p99 = 0.1, 1.9, 2.5
-
         stats = (
-            f"✅ Classified {total} logs\n\n"
-            f"📊 Tier breakdown:\n{tier_lines}\n\n"
-            f"🏷️ Label distribution:\n{label_lines}\n\n"
-            f"⏱️ Performance Metrics:\n"
-            f"  • Total Time: {total_time_sec:.2f} s\n"
-            f"  • P50 Latency: {p50:.1f} ms\n"
-            f"  • P95 Latency: {p95:.1f} ms\n"
-            f"  • P99 Latency: {p99:.1f} ms"
+            f"✅ Classified {total} logs in {total_time_sec:.2f} s\n\n"
+            f"📊 Performance by Tier:\n{tier_lines_str}\n\n"
+            f"🏷️ Label distribution:\n{label_lines}"
         )
         
         progress(1.0, desc="✅ Success")

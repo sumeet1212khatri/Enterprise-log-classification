@@ -1,9 +1,11 @@
 # LogAI-Engine
 
-
+---
+<div align="center">
 <img width="1919" height="943" alt="image" src="https://github.com/user-attachments/assets/ccef8a14-00fc-40c7-a677-4201ff2f1b51" />
+</div>
 
-
+---
 <div align="center">
 
 **A production-grade, 3-tier hybrid log classification pipeline.**  
@@ -16,13 +18,12 @@ Classifies 2,000,000 enterprise logs in under 9 minutes with 92% of traffic hand
 
 </div>
 
----
 
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/00c8d59b-b312-4f0f-b7b1-dce3e4eb4ff0" alt="LogAI-Engine UI" width="100%" />
-</div>
 
----
+
+
+
+
 
 ## Overview
 

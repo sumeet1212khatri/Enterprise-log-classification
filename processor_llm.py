@@ -16,7 +16,6 @@ LLM_MODEL  = "mistralai/Mistral-7B-Instruct-v0.3"
 
 VALID_CATEGORIES = ["Workflow Error", "Deprecation Warning"]
 
-# Retry / timeout config
 MAX_RETRIES     = 2
 RETRY_DELAY_SEC = 1.0   
 REQUEST_TIMEOUT = 5     
@@ -42,7 +41,6 @@ FEW_SHOT_EXAMPLES = [
     },
 ]
 
-# ── Prompt builder ───────────────────────────────────────────────────────────
 def _build_messages(log_msg: str) -> list[dict]:
     categories_str = ", ".join(f'"{c}"' for c in VALID_CATEGORIES)
     user_content = (
@@ -58,7 +56,6 @@ def _build_messages(log_msg: str) -> list[dict]:
         {"role": "user",   "content": user_content},
     ]
 
-# ── Normalize raw LLM output ─────────────────────────────────────────────────
 def _normalize(raw: str) -> str:
     raw = raw.strip().strip('"').strip("'")
     for cat in VALID_CATEGORIES:
@@ -66,14 +63,7 @@ def _normalize(raw: str) -> str:
             return cat
     return "Unclassified"
 
-# ── Main classify function ────────────────────────────────────────────────────
 def classify_with_llm(log_msg: str) -> str:
-    """
-    Tier 3 LLM classifier with:
-      - Timeout (REQUEST_TIMEOUT seconds)
-      - Retry with exponential backoff (MAX_RETRIES attempts)
-      - Explicit fallback to "Unclassified" on all error paths
-    """
     if not HF_TOKEN:
         logger.warning("[LLM] HF_TOKEN not set — returning Unclassified")
         return "Unclassified"
@@ -98,13 +88,14 @@ def classify_with_llm(log_msg: str) -> str:
             return label
 
         except Exception as e:
-            # FIXED: Return standard "Unclassified" so we don't pollute the CSV
-            if "402" in str(e) or "credits" in str(e).lower():
-                logger.error(f"[LLM] Credits Finished (402). Returning Unclassified.")
-                return "Unclassified"
+            # FIX: Safely check for HTTP 402 object attributes instead of raw string matching
+            if hasattr(e, 'response') and e.response is not None:
+                if getattr(e.response, 'status_code', None) == 402:
+                    logger.error(f"[LLM] Credits Finished (402). Returning Unclassified.")
+                    return "Unclassified"
             
             if attempt <= MAX_RETRIES:
-                logger.warning(f"[LLM] Attempt {attempt} failed ({e}), retrying in {delay:.1f}s…")
+                logger.warning(f"[LLM] Attempt {attempt} failed ({type(e).__name__}), retrying in {delay:.1f}s…")
                 time.sleep(delay)
                 delay *= 2  
             else:

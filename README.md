@@ -5,7 +5,7 @@
 ![LogAI-Engine Banner](https://github.com/user-attachments/assets/32c9f5f8-40b3-4d52-bed7-c44842b703fb)
 
 **A production-grade, 3-tier hybrid log classification pipeline.**  
-Classifies **2,000,000** enterprise logs in under **6 minutes** with **92% of traffic** handled at sub-millisecond cost.
+Classifies **2,000,000** enterprise logs in under **9 minutes** with **92% of traffic** handled at sub-millisecond cost.
 
 [![HuggingFace Space](https://img.shields.io/badge/🤗%20HuggingFace-Live%20Demo-FFD21E?style=for-the-badge)](https://huggingface.co/spaces/NOT-OMEGA/LogAI-Engine)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
@@ -93,7 +93,7 @@ ONNX Runtime on CPU delivers 3–5× faster inference than standard PyTorch for 
 `LegacyCRM` emits two label categories — `Workflow Error` and `Deprecation Warning` — that are structurally distinct from other sources and too context-dependent for regex or embedding-based matching. Forcing them through earlier tiers would produce high misclassification rates. Direct LLM routing for a known-problematic source is a deliberate and bounded decision, not a general override.
 
 **Why MD5-based LRU caching on Tier 3?**  
-Enterprise logs frequently repeat: the same error string, the same status code, the same cron job notification. An LRU cache keyed on the MD5 hash of the log message eliminates redundant API calls entirely for these cases. At 2M log scale, this reduced live LLM calls to just 195 — a ~96.7% cache hit rate on LLM-routed traffic.
+Enterprise logs frequently repeat: the same error string, the same status code, the same cron job notification. An LRU cache keyed on the MD5 hash of the log message eliminates redundant API calls entirely for these cases. At 2M log scale, this reduced live LLM calls to just 1,589 out of 6,109 LLM-routed logs — a ~74% cache hit rate on LLM traffic.
 
 **Why `ProcessPoolExecutor` for batch processing?**  
 Python's GIL limits CPU-bound parallelism in threads. Tier 1 (regex) and Tier 2 (ONNX) are CPU-bound. `ProcessPoolExecutor` distributes batch chunks across physical cores, enabling true parallel execution and the 4,131 logs/second throughput observed at 2M scale.
@@ -109,18 +109,18 @@ Stress tested on **2,000,000 real enterprise logs**.
 | Metric | Value |
 |---|---|
 | Total logs | 2,000,000 |
-| Wall time | 484.24 seconds |
-| Throughput | **4,131 logs/second** |
+| Wall time | 318.29 seconds |
+| Throughput | **~6,286 logs/second** |
 | Unclassified rate | 0.31% (6,117 logs) |
 
 ### Tier breakdown
 
 | Tier | Logs Handled | Coverage | p50 Latency | Cost |
 |---|---|---|---|---|
-| 🟢 Regex | 1,844,376 | 92.2% | 0.024ms | Free |
-| 🔵 BERT / ONNX | 149,507 | 7.5% | ~37ms amortized | CPU-only |
-| ⚡ LLM (Cache Hit) | 5,922 | 0.3% | 0.0ms | Free (RAM) |
-| 🟡 LLM (API Call) | 195 | 0.01% | 10.1ms | Minimal |
+| 🟢 Regex | 1,844,376 | 92.2% | 0.020ms (p50) | Free |
+| 🔵 BERT / ONNX | 149,507 | 7.5% | 14.68ms/log (~2,194s batch) | CPU-only |
+| ⚡ LLM (Cache Hit) | 4,520 | 0.2% | 0.0ms | Free (RAM) |
+| 🟡 LLM (API Call) | 1,589 | 0.08% | p50=8.5ms, p95=101ms, p99=120ms | Minimal |
 
 ### Label distribution (2M logs)
 
